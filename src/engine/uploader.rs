@@ -392,11 +392,14 @@ impl QdrantUploader {
     }
 
     /// Mark a file as complete by setting file_complete=true on chunk #1
-    /// 
+    ///
     /// This is called after all chunks for a file have been uploaded.
     /// Uses Qdrant's payload update API to set the field without rewriting the point.
-    pub fn mark_file_complete(&self, file_id: &str) -> Result<()> {
-        // First, find the point ID for chunk #1 of this file
+    ///
+    /// The `catalog` parameter is required to disambiguate when multiple catalogs
+    /// share the same file structure (e.g., multiple clones of the same repo).
+    pub fn mark_file_complete(&self, file_id: &str, catalog: &str) -> Result<()> {
+        // First, find the point ID for chunk #1 of this file in the correct catalog
         #[derive(Debug, Serialize)]
         struct ScrollRequestForId {
             filter: FilterForId,
@@ -417,6 +420,10 @@ impl QdrantUploader {
             serde_json::json!({
                 "key": "chunk_number",
                 "match": { "value": 1 }
+            }),
+            serde_json::json!({
+                "key": "catalog",
+                "match": { "value": catalog }
             }),
         ];
 

@@ -163,7 +163,7 @@ pub fn run_incremental_crawl(
         }
         for (fid, count) in &file_chunks {
             if Some(count) == file_expected.get(fid) {
-                let _ = uploader.mark_file_complete(fid);
+                let _ = uploader.mark_file_complete(fid, catalog_name);
             }
         }
     }

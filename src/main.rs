@@ -533,7 +533,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
         }
         for (fid, count) in &file_chunks {
             if Some(count) == file_expected.get(fid) {
-                let _ = uploader.mark_file_complete(fid);
+                let _ = uploader.mark_file_complete(fid, catalog_name);
             }
         }
 
@@ -656,7 +656,8 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let stop_uploader = Arc::clone(&stop_flag);
     let last_upload_time_clone = Arc::clone(&last_upload_time);
     let uploader_clone = Arc::clone(&uploader);
-    
+    let catalog_name_for_uploader = catalog_name.to_string();
+
     let uploader_thread = std::thread::spawn(move || {
         let mut accumulated: Vec<(engine::Chunk, Vec<f32>)> = Vec::new();
         
@@ -735,7 +736,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                         
                         // Mark completed files and clean up tracking state
                         for file_id in &completed_files {
-                            if let Err(e) = uploader_guard.mark_file_complete(file_id) {
+                            if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
                                 eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
                             }
                             // Remove tracking state for completed files
@@ -795,7 +796,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                             }
                             
                             for file_id in &completed_files {
-                                if let Err(e) = uploader_guard.mark_file_complete(file_id) {
+                                if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
                                     eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
                                 }
                             }
