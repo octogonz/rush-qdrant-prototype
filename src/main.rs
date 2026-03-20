@@ -432,6 +432,13 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
         let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
 
+        // Sort chunks by text length so each batch has similar-length sequences,
+        // minimizing padding waste (attention is O(n²) in padded length)
+        all_chunks.sort_by_key(|c| c.text.len());
+        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
+            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
+            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
+
         let effective_batch_size = if batch_size > 0 { batch_size } else { total_chunks };
         let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
 
