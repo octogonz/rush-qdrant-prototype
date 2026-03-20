@@ -107,16 +107,13 @@ impl ParallelEmbedder {
 
                 if config.use_cuda {
                     use ort::ep::CUDA;
-                    let use_cuda_graph = std::env::var("RUSH_QDRANT_CUDA_GRAPH").unwrap_or_default() == "1";
                     let cuda_ep = CUDA::default()
                         .with_memory_limit(20 * 1024 * 1024 * 1024)
-                        .with_cuda_graph(use_cuda_graph)
                         .build();
                     builder = builder
                         .with_execution_providers([cuda_ep])
                         .expect("Failed to register CUDA execution provider");
-                    println!("  Worker {}: CUDA EP registered (arena: 20GB{})", i,
-                        if use_cuda_graph { ", CUDA Graph ON" } else { "" });
+                    println!("  Worker {}: CUDA execution provider registered (arena cap: 20GB)", i);
                 } else {
                     builder = builder
                         .with_intra_threads(config.intra_threads)
