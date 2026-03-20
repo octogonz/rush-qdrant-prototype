@@ -108,9 +108,9 @@ impl ParallelEmbedder {
                 if config.use_cuda {
                     use ort::ep::CUDA;
                     builder = builder
-                        .with_execution_providers([CUDA::default().with_tf32(true).build()])
+                        .with_execution_providers([CUDA::default().build()])
                         .expect("Failed to register CUDA execution provider");
-                    println!("  Worker {}: CUDA execution provider registered (TF32 enabled)", i);
+                    println!("  Worker {}: CUDA execution provider registered", i);
                 } else {
                     builder = builder
                         .with_intra_threads(config.intra_threads)
