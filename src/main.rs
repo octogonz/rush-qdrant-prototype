@@ -439,30 +439,61 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
             all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
             all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
 
-        let effective_batch_size = if batch_size > 0 { batch_size } else { total_chunks };
-        let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
+        // Adaptive batching: use larger batches for short sequences, smaller for long.
+        // VRAM cost scales as batch_size × seq_len². We calibrate from known-good:
+        // batch=8 at ~1500 tokens fits in 24GB → budget ≈ 8 × 1500² = 18M
+        // Use text length as a proxy for token count (~4 chars per token).
+        const VRAM_BUDGET: f64 = 22_000_000.0;
+        const CHARS_PER_TOKEN: f64 = 4.0;
+        const MIN_BATCH: usize = 4;
+        const MAX_BATCH: usize = 64;
 
-        for (batch_idx, batch_chunks) in all_chunks.chunks(effective_batch_size).enumerate() {
+        let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
+        let mut cursor = 0;
+        let mut batch_idx = 0;
+
+        while cursor < all_chunks.len() {
+            // Estimate token count of the longest chunk in this region
+            // (chunks are sorted, so the longest is at the end of any slice)
+            let longest_chars = all_chunks[cursor..].iter()
+                .take(MAX_BATCH)
+                .last()
+                .map(|c| c.text.len())
+                .unwrap_or(100);
+            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
+            let adaptive_size = (VRAM_BUDGET / (est_tokens * est_tokens)) as usize;
+            let effective_batch_size = if batch_size > 0 {
+                batch_size.min(adaptive_size).max(MIN_BATCH)
+            } else {
+                adaptive_size.clamp(MIN_BATCH, MAX_BATCH)
+            };
+
+            let end = (cursor + effective_batch_size).min(all_chunks.len());
+            let batch_chunks = &all_chunks[cursor..end];
+
             let batch_start = std::time::Instant::now();
             let texts: Vec<&str> = batch_chunks.iter().map(|c| c.text.as_str()).collect();
 
             let embeddings = embedder.encode_batch(&texts)?;
 
             let batch_elapsed = batch_start.elapsed();
-            let offset = batch_idx * effective_batch_size;
-            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks in {:.1}s ({:.1} chunks/sec)",
+            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks (adaptive b={}) in {:.1}s ({:.1} chunks/sec)",
                 chrono_timestamp(),
                 batch_idx + 1,
-                offset + 1,
-                (offset + batch_chunks.len()).min(total_chunks),
+                cursor + 1,
+                end,
                 total_chunks,
                 batch_chunks.len(),
+                effective_batch_size,
                 batch_elapsed.as_secs_f64(),
                 batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
 
             for (chunk, embedding) in batch_chunks.iter().zip(embeddings.into_iter()) {
                 all_embedded.push((chunk.clone(), embedding));
             }
+
+            cursor = end;
+            batch_idx += 1;
         }
 
         let embed_elapsed = embed_start.elapsed();
