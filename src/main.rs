@@ -4,6 +4,8 @@
 //! Intelligently chunks code and documentation for high-quality semantic search
 
 mod engine;
+mod mcp;
+mod watcher;
 
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
@@ -18,27 +20,27 @@ use engine::{
 };
 
 /// Qdrant configuration
-#[derive(Debug, serde::Deserialize)]
-struct QdrantConfig {
-    url: Option<String>,
-    collection: String,
+#[derive(Debug, serde::Deserialize, Clone)]
+pub(crate) struct QdrantConfig {
+    pub(crate) url: Option<String>,
+    pub(crate) collection: String,
 }
 
 /// Catalog configuration
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct CatalogConfig {
+pub(crate) struct CatalogConfig {
     /// Catalog type: "monorepo" or "folder"
-    r#type: String,
+    pub(crate) r#type: String,
     /// Path to scan
-    path: String,
+    pub(crate) path: String,
 }
 
 /// Main configuration file
 #[derive(Debug, serde::Deserialize)]
-struct Config {
-    qdrant: QdrantConfig,
-    catalogs: HashMap<String, CatalogConfig>,
+pub(crate) struct Config {
+    pub(crate) qdrant: QdrantConfig,
+    pub(crate) catalogs: HashMap<String, CatalogConfig>,
 }
 
 /// Rush semantic search crawler for Qdrant
@@ -150,17 +152,26 @@ enum Commands {
         /// Number of files to sample
         #[arg(long, default_value = "20")]
         count: usize,
-        
+
         /// Directory to sample from
         #[arg(long)]
         dir: String,
+    },
+
+    /// Start MCP server for semantic search (long-running daemon).
+    /// Watches all catalogs for changes, re-indexes incrementally,
+    /// and serves search/view as MCP tools over HTTP.
+    Mcp {
+        /// HTTP port for MCP server
+        #[arg(long, default_value = "7436")]
+        port: u16,
     },
 }
 
 const DEFAULT_CONFIG_PATH: &str = "~/.config/rush-qdrant/config.jsonc";
 
 /// Get current timestamp for logging
-fn chrono_timestamp() -> String {
+pub(crate) fn chrono_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -224,12 +235,15 @@ fn main() -> anyhow::Result<()> {
         Commands::AuditChunks { count, dir } => {
             run_audit_chunks(count, dir)?;
         }
+        Commands::Mcp { port } => {
+            mcp::run_mcp(&config, port)?;
+        }
     }
 
     Ok(())
 }
 
-fn load_config(path: &PathBuf) -> anyhow::Result<Config> {
+pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path.display(), e))?;
     
@@ -926,7 +940,7 @@ fn run_search(config: &Config, text: &str, limit: usize, catalog: Option<&str>) 
 /// Run view command to display full chunks by IDs
 /// Parsed selector for file-based chunk queries
 #[derive(Debug, Clone)]
-enum ChunkSelector {
+pub(crate) enum ChunkSelector {
     /// All chunks in the file
     All,
     /// Single chunk at position N (1-indexed)
@@ -944,7 +958,7 @@ enum ChunkSelector {
 /// - `700a4ba232fe9ddc:3` - chunk 3
 /// - `700a4ba232fe9ddc:2-3` - chunks 2 through 3
 /// - `700a4ba232fe9ddc:3-end` - chunk 3 through the last chunk
-fn parse_file_id_with_selector(s: &str) -> anyhow::Result<(String, ChunkSelector)> {
+pub(crate) fn parse_file_id_with_selector(s: &str) -> anyhow::Result<(String, ChunkSelector)> {
     let s = s.trim();
     
     // Check for selector suffix
@@ -1159,7 +1173,7 @@ fn run_purge(config: &Config, catalog: Option<&str>, all: bool) -> anyhow::Resul
 }
 
 /// Check if a file is a text file we want to index
-fn is_text_file(path: &str) -> bool {
+pub(crate) fn is_text_file(path: &str) -> bool {
     let extensions = [
         "ts", "tsx", "js", "jsx",           // TypeScript/JavaScript
         "md", "mdx",                        // Markdown
