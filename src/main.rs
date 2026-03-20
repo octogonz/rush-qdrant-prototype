@@ -416,12 +416,142 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("\n  Found {} chunks to embed", total_chunks);
     println!();
 
-    // Phase 2: Parallel embedding with time-based checkpoints
-    println!("⚡ Phase 2: Embedding {} chunks with {} parallel sessions...", 
+    // Phase 2: Embedding
+    let use_batch = std::env::var("RUSH_QDRANT_BATCH").unwrap_or_default() == "1";
+    let batch_size: usize = std::env::var("RUSH_QDRANT_BATCH_SIZE")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .unwrap_or(0); // 0 = all at once
+
+    if use_batch {
+        // ── Batch-mode path: encode all chunks in large batches, then upload ──
+        println!("⚡ Phase 2 (BATCH): Encoding {} chunks{}...",
+            total_chunks,
+            if batch_size > 0 { format!(" in batches of {}", batch_size) } else { " all at once".to_string() });
+        let embed_start = std::time::Instant::now();
+
+        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+
+        let effective_batch_size = if batch_size > 0 { batch_size } else { total_chunks };
+        let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
+
+        for (batch_idx, batch_chunks) in all_chunks.chunks(effective_batch_size).enumerate() {
+            let batch_start = std::time::Instant::now();
+            let texts: Vec<&str> = batch_chunks.iter().map(|c| c.text.as_str()).collect();
+
+            let embeddings = embedder.encode_batch(&texts)?;
+
+            let batch_elapsed = batch_start.elapsed();
+            let offset = batch_idx * effective_batch_size;
+            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks in {:.1}s ({:.1} chunks/sec)",
+                chrono_timestamp(),
+                batch_idx + 1,
+                offset + 1,
+                (offset + batch_chunks.len()).min(total_chunks),
+                total_chunks,
+                batch_chunks.len(),
+                batch_elapsed.as_secs_f64(),
+                batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
+
+            for (chunk, embedding) in batch_chunks.iter().zip(embeddings.into_iter()) {
+                all_embedded.push((chunk.clone(), embedding));
+            }
+        }
+
+        let embed_elapsed = embed_start.elapsed();
+        let embed_rate = total_chunks as f64 / embed_elapsed.as_secs_f64().max(0.001);
+        println!("  Embedding complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
+
+        // Upload all at once
+        println!("  Uploading {} chunks to Qdrant...", all_embedded.len());
+        let upload_start = std::time::Instant::now();
+
+        // Upload in batches of 100 to avoid exceeding Qdrant limits
+        for upload_batch in all_embedded.chunks(100) {
+            uploader.upload_batch(upload_batch)?;
+        }
+
+        // Mark files complete
+        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (chunk, _) in &all_embedded {
+            let fid = engine::util::display_file_id(chunk.file_id);
+            *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+            file_expected.entry(fid).or_insert(chunk.chunk_count);
+        }
+        for (fid, count) in &file_chunks {
+            if Some(count) == file_expected.get(fid) {
+                let _ = uploader.mark_file_complete(fid);
+            }
+        }
+
+        let upload_elapsed = upload_start.elapsed();
+        println!("  Upload complete: {:.1}s", upload_elapsed.as_secs_f64());
+
+        let total_elapsed_phase2 = embed_elapsed.as_secs_f64() + upload_elapsed.as_secs_f64();
+        println!();
+        println!("  ✅ Embedded & uploaded {} chunks in {}", total_chunks, format_duration(total_elapsed_phase2));
+        println!("  📊 Embedding rate: {:.1} chunks/sec (embed only)", embed_rate);
+        println!("  📊 Overall Phase 2 rate: {:.1} chunks/sec (embed + upload)", total_chunks as f64 / total_elapsed_phase2.max(0.001));
+        println!();
+
+        // Phase 3: Cleanup orphaned files
+        println!("🗑️  Cleaning up orphaned files...");
+        for (file_path, _) in existing_files.iter() {
+            if !files_set.contains(file_path) {
+                uploader.delete_file(file_path, catalog_name)?;
+                files_deleted += 1;
+            }
+        }
+
+        println!();
+        println!();
+        let total_elapsed = total_start.elapsed();
+
+        println!("✅ Crawl complete!");
+        println!();
+        println!("📊 Summary:");
+        println!("  Total time: {:?}", total_elapsed);
+        println!("  New files indexed: {}", new_count);
+        println!("  Changed files re-indexed: {}", changed_count);
+        println!("  Unchanged files skipped: {}", unchanged_count);
+        println!("  Orphaned files deleted: {}", orphaned_count);
+        println!();
+        println!("Total chunks indexed: {}", total_chunks);
+        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
+        println!("Files deleted from DB: {}", files_deleted);
+        println!();
+
+        // Update warning state
+        let mut next_warning_files: HashSet<String> = HashSet::new();
+        next_warning_files.extend(crawl_warning_files.iter().cloned());
+        if incremental_warnings {
+            next_warning_files.extend(warning_files.iter().cloned());
+        }
+        let json = serde_json::to_string_pretty(&next_warning_files)?;
+        std::fs::write(&warning_state_path, json)?;
+
+        if !crawl_warning_files.is_empty() {
+            let plural = if crawl_warning_files.len() == 1 { "file" } else { "files" };
+            println!("Chunking warnings in {} {}:", crawl_warning_files.len(), plural);
+            for file in crawl_warning_files.iter().take(20) {
+                println!("  - {}", file);
+            }
+            if crawl_warning_files.len() > 20 {
+                println!("  ... and {} more", crawl_warning_files.len() - 20);
+            }
+            println!();
+        }
+
+        return Ok(());
+    }
+
+    // ── Original streaming path (non-batch) ──
+    println!("⚡ Phase 2: Embedding {} chunks with {} parallel sessions...",
         total_chunks, embedder.num_workers());
     println!("  (Checkpoints every 60s - safe to CTRL+C)");
     let embed_start = std::time::Instant::now();
-    
+
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
