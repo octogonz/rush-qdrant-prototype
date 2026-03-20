@@ -432,68 +432,84 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
         let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
 
-        // Sort chunks by text length so each batch has similar-length sequences,
-        // minimizing padding waste (attention is O(n²) in padded length)
-        all_chunks.sort_by_key(|c| c.text.len());
-        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
-            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
-            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
-
-        // Adaptive batching: use larger batches for short sequences, smaller for long.
-        // VRAM cost scales as batch_size × seq_len². We calibrate from known-good:
-        // batch=8 at ~1500 tokens fits in 24GB → budget ≈ 8 × 1500² = 18M
-        // Use text length as a proxy for token count (~4 chars per token).
-        const VRAM_BUDGET: f64 = 18_000_000.0;
+        // ── Bucketed batching ──
+        // Group chunks into fixed-size token buckets. Each bucket has a fixed
+        // pad length and batch size, which makes VRAM usage predictable and
+        // enables CUDA Graphs (same tensor shapes within a bucket).
+        //
+        // Bucket design: (max_tokens, batch_size)
+        // VRAM cost ≈ batch × max_tokens² × hidden × layers × bytes
+        // Calibrated from: b=8 at 1500 tokens fits in ~17GB arena.
         const CHARS_PER_TOKEN: f64 = 4.0;
-        const MIN_BATCH: usize = 4;
-        const MAX_BATCH: usize = 64;
+        struct Bucket {
+            max_chars: usize,     // chunk text length ceiling
+            max_tokens: usize,    // pad-to length for ONNX
+            batch_size: usize,    // fixed batch size
+        }
+        let buckets = [
+            Bucket { max_chars: 200,  max_tokens: 128,  batch_size: 64 },
+            Bucket { max_chars: 500,  max_tokens: 256,  batch_size: 64 },
+            Bucket { max_chars: 1000, max_tokens: 512,  batch_size: 64 },
+            Bucket { max_chars: 2000, max_tokens: 768,  batch_size: 32 },
+            Bucket { max_chars: 4000, max_tokens: 1536, batch_size: 16 },
+            Bucket { max_chars: 8000, max_tokens: 2048, batch_size: 8  },
+        ];
+
+        // Assign each chunk to a bucket index
+        let mut bucketed_chunks: Vec<Vec<usize>> = vec![Vec::new(); buckets.len()];
+        for (i, chunk) in all_chunks.iter().enumerate() {
+            let bucket_idx = buckets.iter()
+                .position(|b| chunk.text.len() <= b.max_chars)
+                .unwrap_or(buckets.len() - 1);
+            bucketed_chunks[bucket_idx].push(i);
+        }
+
+        // Print bucket distribution
+        for (bi, bucket) in buckets.iter().enumerate() {
+            if !bucketed_chunks[bi].is_empty() {
+                println!("  Bucket {} (≤{}chars, pad={}, b={}): {} chunks",
+                    bi, bucket.max_chars, bucket.max_tokens, bucket.batch_size,
+                    bucketed_chunks[bi].len());
+            }
+        }
 
         let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
-        let mut cursor = 0;
-        let mut batch_idx = 0;
+        let mut global_batch_idx = 0;
 
-        while cursor < all_chunks.len() {
-            // Estimate token count of the longest chunk in this region
-            // (chunks are sorted, so the longest is at the end of any slice)
-            let longest_chars = all_chunks[cursor..].iter()
-                .take(MAX_BATCH)
-                .last()
-                .map(|c| c.text.len())
-                .unwrap_or(100);
-            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
-            let adaptive_size = (VRAM_BUDGET / (est_tokens * est_tokens)) as usize;
-            let effective_batch_size = if batch_size > 0 {
-                batch_size.min(adaptive_size).max(MIN_BATCH)
-            } else {
-                adaptive_size.clamp(MIN_BATCH, MAX_BATCH)
-            };
-
-            let end = (cursor + effective_batch_size).min(all_chunks.len());
-            let batch_chunks = &all_chunks[cursor..end];
-
-            let batch_start = std::time::Instant::now();
-            let texts: Vec<&str> = batch_chunks.iter().map(|c| c.text.as_str()).collect();
-
-            let embeddings = embedder.encode_batch(&texts)?;
-
-            let batch_elapsed = batch_start.elapsed();
-            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks (adaptive b={}) in {:.1}s ({:.1} chunks/sec)",
-                chrono_timestamp(),
-                batch_idx + 1,
-                cursor + 1,
-                end,
-                total_chunks,
-                batch_chunks.len(),
-                effective_batch_size,
-                batch_elapsed.as_secs_f64(),
-                batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
-
-            for (chunk, embedding) in batch_chunks.iter().zip(embeddings.into_iter()) {
-                all_embedded.push((chunk.clone(), embedding));
+        for (bi, chunk_indices) in bucketed_chunks.iter().enumerate() {
+            if chunk_indices.is_empty() {
+                continue;
             }
+            let bucket = &buckets[bi];
 
-            cursor = end;
-            batch_idx += 1;
+            for batch_start_idx in (0..chunk_indices.len()).step_by(bucket.batch_size) {
+                let batch_end_idx = (batch_start_idx + bucket.batch_size).min(chunk_indices.len());
+                let batch_indices = &chunk_indices[batch_start_idx..batch_end_idx];
+
+                let texts: Vec<&str> = batch_indices.iter()
+                    .map(|&i| all_chunks[i].text.as_str())
+                    .collect();
+
+                let batch_start = std::time::Instant::now();
+                let embeddings = embedder.encode_batch_padded(&texts, bucket.max_tokens)?;
+                let batch_elapsed = batch_start.elapsed();
+
+                let embedded_so_far = all_embedded.len() + batch_indices.len();
+                eprintln!("[{}] Bucket {} batch {} ({}/{} total): {} chunks (pad={}, b={}) in {:.1}s ({:.1} chunks/sec)",
+                    chrono_timestamp(),
+                    bi, global_batch_idx + 1,
+                    embedded_so_far, total_chunks,
+                    batch_indices.len(),
+                    bucket.max_tokens, bucket.batch_size,
+                    batch_elapsed.as_secs_f64(),
+                    batch_indices.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
+
+                for (&chunk_idx, embedding) in batch_indices.iter().zip(embeddings.into_iter()) {
+                    all_embedded.push((all_chunks[chunk_idx].clone(), embedding));
+                }
+
+                global_batch_idx += 1;
+            }
         }
 
         let embed_elapsed = embed_start.elapsed();
