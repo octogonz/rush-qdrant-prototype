@@ -106,34 +106,14 @@ impl ParallelEmbedder {
                     .expect("Failed to set optimization level");
 
                 if config.use_cuda {
-                    let use_tensorrt = std::env::var("RUSH_QDRANT_TENSORRT").unwrap_or_default() == "1";
-
-                    if use_tensorrt {
-                        use ort::ep::TensorRT;
-                        let trt_ep = TensorRT::default()
-                            .with_fp16(true)
-                            .with_engine_cache(true)
-                            .with_engine_cache_path("./trt_cache")
-                            .build();
-                        // TensorRT EP with CUDA EP fallback for unsupported ops
-                        use ort::ep::CUDA;
-                        let cuda_ep = CUDA::default()
-                            .with_memory_limit(20 * 1024 * 1024 * 1024)
-                            .build();
-                        builder = builder
-                            .with_execution_providers([trt_ep, cuda_ep])
-                            .expect("Failed to register TensorRT execution provider");
-                        println!("  Worker {}: TensorRT FP16 + CUDA fallback (arena: 20GB)", i);
-                    } else {
-                        use ort::ep::CUDA;
-                        let cuda_ep = CUDA::default()
-                            .with_memory_limit(20 * 1024 * 1024 * 1024)
-                            .build();
-                        builder = builder
-                            .with_execution_providers([cuda_ep])
-                            .expect("Failed to register CUDA execution provider");
-                        println!("  Worker {}: CUDA execution provider registered (arena cap: 20GB)", i);
-                    }
+                    use ort::ep::CUDA;
+                    let cuda_ep = CUDA::default()
+                        .with_memory_limit(20 * 1024 * 1024 * 1024)
+                        .build();
+                    builder = builder
+                        .with_execution_providers([cuda_ep])
+                        .expect("Failed to register CUDA execution provider");
+                    println!("  Worker {}: CUDA execution provider registered (arena cap: 20GB)", i);
                 } else {
                     builder = builder
                         .with_intra_threads(config.intra_threads)
