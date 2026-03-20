@@ -107,10 +107,13 @@ impl ParallelEmbedder {
 
                 if config.use_cuda {
                     use ort::ep::CUDA;
+                    let cuda_ep = CUDA::default()
+                        .with_memory_limit(20 * 1024 * 1024 * 1024)
+                        .build();
                     builder = builder
-                        .with_execution_providers([CUDA::default().build()])
+                        .with_execution_providers([cuda_ep])
                         .expect("Failed to register CUDA execution provider");
-                    println!("  Worker {}: CUDA execution provider registered", i);
+                    println!("  Worker {}: CUDA execution provider registered (arena cap: 20GB)", i);
                 } else {
                     builder = builder
                         .with_intra_threads(config.intra_threads)

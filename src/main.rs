@@ -443,7 +443,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
         // VRAM cost scales as batch_size × seq_len². We calibrate from known-good:
         // batch=8 at ~1500 tokens fits in 24GB → budget ≈ 8 × 1500² = 18M
         // Use text length as a proxy for token count (~4 chars per token).
-        const VRAM_BUDGET: f64 = 22_000_000.0;
+        const VRAM_BUDGET: f64 = 18_000_000.0;
         const CHARS_PER_TOKEN: f64 = 4.0;
         const MIN_BATCH: usize = 4;
         const MAX_BATCH: usize = 64;
