@@ -149,13 +149,6 @@ impl ParallelEmbedder {
     /// Pads all sequences to the max length within the batch.
     /// Returns one embedding per input text.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.encode_batch_padded(texts, 0)
-    }
-
-    /// Encode a batch of texts, padding to a fixed length (bucket ceiling).
-    /// If pad_to == 0, pads to the max length within the batch.
-    /// A fixed pad_to enables CUDA Graphs (same tensor shapes across calls).
-    pub fn encode_batch_padded(&self, texts: &[&str], pad_to: usize) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -170,15 +163,11 @@ impl ParallelEmbedder {
                 .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e)))
             .collect::<Result<Vec<_>>>()?;
 
-        // Pad to bucket ceiling or batch max
-        let max_len = if pad_to > 0 {
-            pad_to
-        } else {
-            encodings.iter()
-                .map(|e| e.get_ids().len().min(MAX_LENGTH))
-                .max()
-                .unwrap_or(0)
-        };
+        // Find max sequence length (capped at MAX_LENGTH)
+        let max_len = encodings.iter()
+            .map(|e| e.get_ids().len().min(MAX_LENGTH))
+            .max()
+            .unwrap_or(0);
 
         let batch_size = texts.len();
 
@@ -189,7 +178,7 @@ impl ParallelEmbedder {
         for (i, encoding) in encodings.iter().enumerate() {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
-            let seq_len = ids.len().min(MAX_LENGTH).min(max_len);
+            let seq_len = ids.len().min(MAX_LENGTH);
 
             for j in 0..seq_len {
                 input_ids_flat[i * max_len + j] = ids[j] as i64;
@@ -209,7 +198,7 @@ impl ParallelEmbedder {
         // Mean pooling per sequence (only over non-padded positions)
         let mut results = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
-            let seq_len = encodings[i].get_ids().len().min(MAX_LENGTH).min(max_len);
+            let seq_len = encodings[i].get_ids().len().min(MAX_LENGTH);
             let embedding: Vec<f32> = (0..HIDDEN_SIZE)
                 .map(|h| {
                     (0..seq_len)
