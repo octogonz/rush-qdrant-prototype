@@ -181,9 +181,19 @@ async fn handle_post(
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
 
+            // Log tool calls for usage tracking
             match tool_name {
-                "semantic_search" => handle_search(state, req.id, arguments).await,
-                "view_chunks" => handle_view(state, req.id, arguments).await,
+                "semantic_search" => {
+                    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("?");
+                    let catalog = arguments.get("catalog").and_then(|v| v.as_str()).unwrap_or("*");
+                    eprintln!("[query] semantic_search catalog={catalog} query={query:?}");
+                    handle_search(state, req.id, arguments).await
+                }
+                "view_chunks" => {
+                    let ids = arguments.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    eprintln!("[query] view_chunks ids={ids}");
+                    handle_view(state, req.id, arguments).await
+                }
                 _ => HttpResponse::Ok()
                     .insert_header(("Content-Type", "application/json"))
                     .json(JsonRpcResponse::error(
