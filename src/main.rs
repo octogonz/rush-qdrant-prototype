@@ -299,7 +299,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
     // Scan directory
     println!("📂 Scanning directory...");
-    let mut files_to_process: Vec<String> = Vec::new();
+    let mut files_to_process: Vec<(String, String)> = Vec::new(); // (absolute_path, relative_path)
 
     for entry in walkdir::WalkDir::new(directory)
         .into_iter()
@@ -307,9 +307,15 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path().to_string_lossy().to_string();
-        
+
         if !should_skip_path(&path) && is_text_file(&path) {
-            files_to_process.push(path);
+            let rel_path = path
+                .strip_prefix(directory)
+                .unwrap_or(&path)
+                .trim_start_matches('/')
+                .trim_start_matches('\\')
+                .to_string();
+            files_to_process.push((path, rel_path));
         }
     }
 
@@ -324,9 +330,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let mut orphaned_count = 0;
     
     // Find orphaned files (in DB but not on disk)
-    let files_set: std::collections::HashSet<String> = files_to_process.iter().cloned().collect();
-    for (file_path, _) in existing_files.iter() {
-        if !files_set.contains(file_path) {
+    let rel_files_set: std::collections::HashSet<String> = files_to_process.iter().map(|(_, rel)| rel.clone()).collect();
+    for (rel_path, _) in existing_files.iter() {
+        if !rel_files_set.contains(rel_path) {
             orphaned_count += 1;
         }
     }
@@ -339,10 +345,10 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let mut crawl_warning_files: HashSet<String> = HashSet::new();
     let mut warning_count: usize = 0;
     
-    for (idx, file_path) in files_to_process.iter().enumerate() {
+    for (idx, (file_path, rel_path)) in files_to_process.iter().enumerate() {
         // Progress indicator
-        print!("\r  Chunking file {}/{} ({:.0}%) | warnings: {}   ", 
-            idx + 1, total_files, 
+        print!("\r  Chunking file {}/{} ({:.0}%) | warnings: {}   ",
+            idx + 1, total_files,
             ((idx + 1) as f64 / total_files as f64) * 100.0,
             warning_count);
         std::io::Write::flush(&mut std::io::stdout())?;
@@ -355,16 +361,16 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 continue;
             }
         };
-        
+
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let current_hash = format!("sha256:{:x}", hasher.finalize());
 
-        // Check if file changed
-        if let Some(existing_info) = existing_files.get(file_path) {
+        // Check if file changed (using relative path for portability across machines)
+        if let Some(existing_info) = existing_files.get(rel_path) {
             if existing_info.content_hash == current_hash && existing_info.file_complete {
-                let has_warning = warning_files.contains(file_path);
+                let has_warning = warning_files.contains(rel_path);
                 if has_warning && !incremental_warnings {
                     // Sticky retry for warning files: always reprocess until clean
                 } else {
@@ -372,9 +378,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                     continue; // Skip unchanged and complete file
                 }
             }
-            
+
             // File changed or incomplete - delete old chunks
-            uploader.delete_file(file_path, catalog_name)?;
+            uploader.delete_file(rel_path, catalog_name)?;
             files_deleted += 1;
             if existing_info.content_hash != current_hash {
                 changed_count += 1;
@@ -406,7 +412,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 let had_warning = chunks.iter().any(|c| c.breadcrumb.contains("[fallback-split]"));
                 if had_warning {
                     warning_count += 1;
-                    crawl_warning_files.insert(file_path.clone());
+                    crawl_warning_files.insert(rel_path.clone());
                     println!();
                     println!("Warning: Couldn't find a splitpoint for {}", file_path);
                 }
@@ -549,9 +555,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
         // Phase 3: Cleanup orphaned files
         println!("🗑️  Cleaning up orphaned files...");
-        for (file_path, _) in existing_files.iter() {
-            if !files_set.contains(file_path) {
-                uploader.delete_file(file_path, catalog_name)?;
+        for (rel_path, _) in existing_files.iter() {
+            if !rel_files_set.contains(rel_path) {
+                uploader.delete_file(rel_path, catalog_name)?;
                 files_deleted += 1;
             }
         }
@@ -853,9 +859,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("🗑️  Cleaning up orphaned files...");
     {
         let uploader_guard = uploader.lock().unwrap();
-        for (file_path, _) in existing_files.iter() {
-            if !files_set.contains(file_path) {
-                uploader_guard.delete_file(file_path, catalog_name)?;
+        for (rel_path, _) in existing_files.iter() {
+            if !rel_files_set.contains(rel_path) {
+                uploader_guard.delete_file(rel_path, catalog_name)?;
                 files_deleted += 1;
             }
         }

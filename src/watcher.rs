@@ -43,7 +43,7 @@ pub fn run_incremental_crawl(
     let existing_files = uploader.get_catalog_files(catalog_name)?;
 
     // Scan directory
-    let mut files_to_process: Vec<String> = Vec::new();
+    let mut files_to_process: Vec<(String, String)> = Vec::new(); // (absolute_path, relative_path)
     for entry in walkdir::WalkDir::new(directory)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -51,18 +51,24 @@ pub fn run_incremental_crawl(
     {
         let path = entry.path().to_string_lossy().to_string();
         if !should_skip_path(&path) && is_text_file(&path) {
-            files_to_process.push(path);
+            let rel_path = path
+                .strip_prefix(directory)
+                .unwrap_or(&path)
+                .trim_start_matches('/')
+                .trim_start_matches('\\')
+                .to_string();
+            files_to_process.push((path, rel_path));
         }
     }
 
-    let files_set: HashSet<String> = files_to_process.iter().cloned().collect();
+    let rel_files_set: HashSet<String> = files_to_process.iter().map(|(_, rel)| rel.clone()).collect();
 
     let mut new_count = 0;
     let mut changed_count = 0;
     let mut unchanged_count = 0;
     let mut all_chunks: Vec<crate::engine::Chunk> = Vec::new();
 
-    for file_path in &files_to_process {
+    for (file_path, rel_path) in &files_to_process {
         // Read file and compute hash
         let content = match std::fs::read_to_string(file_path) {
             Ok(c) => c,
@@ -74,14 +80,14 @@ pub fn run_incremental_crawl(
         hasher.update(content.as_bytes());
         let current_hash = format!("sha256:{:x}", hasher.finalize());
 
-        // Check if unchanged
-        if let Some(existing_info) = existing_files.get(file_path) {
+        // Check if unchanged (using relative path for portability across machines)
+        if let Some(existing_info) = existing_files.get(rel_path) {
             if existing_info.content_hash == current_hash && existing_info.file_complete {
                 unchanged_count += 1;
                 continue;
             }
             // Changed or incomplete — delete old chunks
-            uploader.delete_file(file_path, catalog_name)?;
+            uploader.delete_file(rel_path, catalog_name)?;
             changed_count += 1;
         } else {
             new_count += 1;
@@ -120,9 +126,9 @@ pub fn run_incremental_crawl(
 
     // Delete orphaned files
     let mut deleted_count = 0;
-    for (file_path, _) in existing_files.iter() {
-        if !files_set.contains(file_path) {
-            uploader.delete_file(file_path, catalog_name)?;
+    for (rel_path, _) in existing_files.iter() {
+        if !rel_files_set.contains(rel_path) {
+            uploader.delete_file(rel_path, catalog_name)?;
             deleted_count += 1;
         }
     }
