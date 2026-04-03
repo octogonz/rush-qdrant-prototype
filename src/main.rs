@@ -4,6 +4,8 @@
 //! Intelligently chunks code and documentation for high-quality semantic search
 
 mod engine;
+mod mcp;
+mod watcher;
 
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
@@ -18,27 +20,27 @@ use engine::{
 };
 
 /// Qdrant configuration
-#[derive(Debug, serde::Deserialize)]
-struct QdrantConfig {
-    url: Option<String>,
-    collection: String,
+#[derive(Debug, serde::Deserialize, Clone)]
+pub(crate) struct QdrantConfig {
+    pub(crate) url: Option<String>,
+    pub(crate) collection: String,
 }
 
 /// Catalog configuration
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct CatalogConfig {
+pub(crate) struct CatalogConfig {
     /// Catalog type: "monorepo" or "folder"
-    r#type: String,
+    pub(crate) r#type: String,
     /// Path to scan
-    path: String,
+    pub(crate) path: String,
 }
 
 /// Main configuration file
 #[derive(Debug, serde::Deserialize)]
-struct Config {
-    qdrant: QdrantConfig,
-    catalogs: HashMap<String, CatalogConfig>,
+pub(crate) struct Config {
+    pub(crate) qdrant: QdrantConfig,
+    pub(crate) catalogs: HashMap<String, CatalogConfig>,
 }
 
 /// Rush semantic search crawler for Qdrant
@@ -150,17 +152,26 @@ enum Commands {
         /// Number of files to sample
         #[arg(long, default_value = "20")]
         count: usize,
-        
+
         /// Directory to sample from
         #[arg(long)]
         dir: String,
+    },
+
+    /// Start MCP server for semantic search (long-running daemon).
+    /// Watches all catalogs for changes, re-indexes incrementally,
+    /// and serves search/view as MCP tools over HTTP.
+    Mcp {
+        /// HTTP port for MCP server
+        #[arg(long, default_value = "7436")]
+        port: u16,
     },
 }
 
 const DEFAULT_CONFIG_PATH: &str = "~/.config/rush-qdrant/config.jsonc";
 
 /// Get current timestamp for logging
-fn chrono_timestamp() -> String {
+pub(crate) fn chrono_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -224,12 +235,15 @@ fn main() -> anyhow::Result<()> {
         Commands::AuditChunks { count, dir } => {
             run_audit_chunks(count, dir)?;
         }
+        Commands::Mcp { port } => {
+            mcp::run_mcp(&config, port)?;
+        }
     }
 
     Ok(())
 }
 
-fn load_config(path: &PathBuf) -> anyhow::Result<Config> {
+pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path.display(), e))?;
     
@@ -285,7 +299,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
     // Scan directory
     println!("📂 Scanning directory...");
-    let mut files_to_process: Vec<String> = Vec::new();
+    let mut files_to_process: Vec<(String, String)> = Vec::new(); // (absolute_path, relative_path)
 
     for entry in walkdir::WalkDir::new(directory)
         .into_iter()
@@ -293,9 +307,15 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path().to_string_lossy().to_string();
-        
+
         if !should_skip_path(&path) && is_text_file(&path) {
-            files_to_process.push(path);
+            let rel_path = path
+                .strip_prefix(directory)
+                .unwrap_or(&path)
+                .trim_start_matches('/')
+                .trim_start_matches('\\')
+                .to_string();
+            files_to_process.push((path, rel_path));
         }
     }
 
@@ -310,9 +330,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let mut orphaned_count = 0;
     
     // Find orphaned files (in DB but not on disk)
-    let files_set: std::collections::HashSet<String> = files_to_process.iter().cloned().collect();
-    for (file_path, _) in existing_files.iter() {
-        if !files_set.contains(file_path) {
+    let rel_files_set: std::collections::HashSet<String> = files_to_process.iter().map(|(_, rel)| rel.clone()).collect();
+    for (rel_path, _) in existing_files.iter() {
+        if !rel_files_set.contains(rel_path) {
             orphaned_count += 1;
         }
     }
@@ -325,10 +345,10 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let mut crawl_warning_files: HashSet<String> = HashSet::new();
     let mut warning_count: usize = 0;
     
-    for (idx, file_path) in files_to_process.iter().enumerate() {
+    for (idx, (file_path, rel_path)) in files_to_process.iter().enumerate() {
         // Progress indicator
-        print!("\r  Chunking file {}/{} ({:.0}%) | warnings: {}   ", 
-            idx + 1, total_files, 
+        print!("\r  Chunking file {}/{} ({:.0}%) | warnings: {}   ",
+            idx + 1, total_files,
             ((idx + 1) as f64 / total_files as f64) * 100.0,
             warning_count);
         std::io::Write::flush(&mut std::io::stdout())?;
@@ -341,16 +361,16 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 continue;
             }
         };
-        
+
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let current_hash = format!("sha256:{:x}", hasher.finalize());
 
-        // Check if file changed
-        if let Some(existing_info) = existing_files.get(file_path) {
+        // Check if file changed (using relative path for portability across machines)
+        if let Some(existing_info) = existing_files.get(rel_path) {
             if existing_info.content_hash == current_hash && existing_info.file_complete {
-                let has_warning = warning_files.contains(file_path);
+                let has_warning = warning_files.contains(rel_path);
                 if has_warning && !incremental_warnings {
                     // Sticky retry for warning files: always reprocess until clean
                 } else {
@@ -358,9 +378,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                     continue; // Skip unchanged and complete file
                 }
             }
-            
+
             // File changed or incomplete - delete old chunks
-            uploader.delete_file(file_path, catalog_name)?;
+            uploader.delete_file(rel_path, catalog_name)?;
             files_deleted += 1;
             if existing_info.content_hash != current_hash {
                 changed_count += 1;
@@ -392,7 +412,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 let had_warning = chunks.iter().any(|c| c.breadcrumb.contains("[fallback-split]"));
                 if had_warning {
                     warning_count += 1;
-                    crawl_warning_files.insert(file_path.clone());
+                    crawl_warning_files.insert(rel_path.clone());
                     println!();
                     println!("Warning: Couldn't find a splitpoint for {}", file_path);
                 }
@@ -416,12 +436,286 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("\n  Found {} chunks to embed", total_chunks);
     println!();
 
-    // Phase 2: Parallel embedding with time-based checkpoints
-    println!("⚡ Phase 2: Embedding {} chunks with {} parallel sessions...", 
+    // Phase 2: Embedding
+    let use_batch = std::env::var("RUSH_QDRANT_BATCH").unwrap_or_default() == "1";
+    let use_cpu_batch = std::env::var("RUSH_QDRANT_CPU_BATCH").unwrap_or_default() == "1";
+    let batch_size: usize = std::env::var("RUSH_QDRANT_BATCH_SIZE")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .unwrap_or(0); // 0 = all at once
+
+    if use_cpu_batch {
+        // ── CPU parallel-batch path: sort by length, mini-batch, distribute across workers ──
+        println!("⚡ Phase 2 (CPU-BATCH): Encoding {} chunks with {} workers (sorted + mini-batched)...",
+            total_chunks, embedder.num_workers());
+        let embed_start = std::time::Instant::now();
+
+        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+
+        // Sort chunks by text length for efficient batching
+        all_chunks.sort_by_key(|c| c.text.len());
+        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
+            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
+            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
+
+        // Create adaptive mini-batches
+        const CHARS_PER_TOKEN: f64 = 4.0;
+        let mut mini_batches: Vec<Vec<engine::Chunk>> = Vec::new();
+        let mut cursor = 0;
+        while cursor < all_chunks.len() {
+            let longest_chars = all_chunks[cursor..]
+                .iter()
+                .take(32)
+                .last()
+                .map(|c| c.text.len())
+                .unwrap_or(100);
+            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
+            let mb_size = ((4000.0 / est_tokens) as usize).clamp(4, 16);
+            let end = (cursor + mb_size).min(all_chunks.len());
+            mini_batches.push(all_chunks[cursor..end].to_vec());
+            cursor = end;
+        }
+        // Free original chunks — mini_batches owns copies now
+        drop(all_chunks);
+
+        println!("  Created {} mini-batches (sizes: {}-{})",
+            mini_batches.len(),
+            mini_batches.iter().map(|b| b.len()).min().unwrap_or(0),
+            mini_batches.iter().map(|b| b.len()).max().unwrap_or(0));
+
+        use rayon::prelude::*;
+        let all_embedded: Vec<(engine::Chunk, Vec<f32>)> = mini_batches
+            .into_par_iter()
+            .enumerate()
+            .flat_map(|(i, batch)| {
+                let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+                match embedder.encode_batch_on_worker(&texts, i) {
+                    Ok(embeddings) => batch.into_iter().zip(embeddings).collect::<Vec<_>>(),
+                    Err(e) => {
+                        eprintln!("[{}] ⚠️ Batch embedding failed: {}", chrono_timestamp(), e);
+                        Vec::new()
+                    }
+                }
+            })
+            .collect();
+
+        let embed_elapsed = embed_start.elapsed();
+        let embed_rate = all_embedded.len() as f64 / embed_elapsed.as_secs_f64().max(0.001);
+        println!("  Embedding complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
+
+        // Upload in batches of 100 and track file completion
+        println!("  Uploading {} chunks to Qdrant...", all_embedded.len());
+        let upload_start = std::time::Instant::now();
+        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for upload_batch in all_embedded.chunks(100) {
+            uploader.upload_batch(upload_batch)?;
+            for (chunk, _) in upload_batch {
+                let fid = engine::util::display_file_id(chunk.file_id);
+                *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                file_expected.entry(fid).or_insert(chunk.chunk_count);
+            }
+        }
+        for (fid, count) in &file_chunks {
+            if Some(count) == file_expected.get(fid) {
+                let _ = uploader.mark_file_complete(fid, catalog_name);
+            }
+        }
+        let embedded_count = all_embedded.len();
+        drop(all_embedded);
+
+        let upload_elapsed = upload_start.elapsed();
+        let total_phase2 = embed_elapsed.as_secs_f64() + upload_elapsed.as_secs_f64();
+        println!();
+        println!("  ✅ Embedded & uploaded {} chunks in {}", embedded_count, format_duration(total_phase2));
+        println!("  📊 Embedding rate: {:.1} chunks/sec (embed only)", embed_rate);
+        println!("  📊 Overall Phase 2 rate: {:.1} chunks/sec (embed + upload)", embedded_count as f64 / total_phase2.max(0.001));
+        println!();
+
+        // Phase 3: Cleanup
+        println!("🗑️  Cleaning up orphaned files...");
+        for (file_path, _) in existing_files.iter() {
+            if !files_set.contains(file_path) {
+                uploader.delete_file(file_path, catalog_name)?;
+                files_deleted += 1;
+            }
+        }
+
+        println!();
+        let total_elapsed = total_start.elapsed();
+        println!("✅ Crawl complete!");
+        println!("  Total time: {:?}", total_elapsed);
+        println!("  New files indexed: {}", new_count);
+        println!("  Changed files re-indexed: {}", changed_count);
+        println!("  Unchanged files skipped: {}", unchanged_count);
+        println!("Total chunks indexed: {}", total_chunks);
+        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
+
+        return Ok(());
+    } else if use_batch {
+        // ── Batch-mode path: encode chunks in adaptive batches, upload immediately ──
+        println!("⚡ Phase 2 (BATCH): Encoding {} chunks{}...",
+            total_chunks,
+            if batch_size > 0 { format!(" in batches of {}", batch_size) } else { " all at once".to_string() });
+        let embed_start = std::time::Instant::now();
+
+        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+
+        // Sort chunks by text length so each batch has similar-length sequences,
+        // minimizing padding waste (attention is O(n²) in padded length)
+        all_chunks.sort_by_key(|c| c.text.len());
+        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
+            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
+            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
+
+        // Adaptive batching: use larger batches for short sequences, smaller for long.
+        // VRAM cost scales as batch_size × seq_len². We calibrate from known-good:
+        // batch=8 at ~1500 tokens fits in 24GB → budget ≈ 8 × 1500² = 18M
+        // Use text length as a proxy for token count (~4 chars per token).
+        const VRAM_BUDGET: f64 = 18_000_000.0;
+        const CHARS_PER_TOKEN: f64 = 4.0;
+        const MIN_BATCH: usize = 4;
+        const MAX_BATCH: usize = 64;
+
+        let mut total_embedded: usize = 0;
+        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut cursor = 0;
+        let mut batch_idx = 0;
+
+        while cursor < all_chunks.len() {
+            // Estimate token count of the longest chunk in this region
+            // (chunks are sorted, so the longest is at the end of any slice)
+            let longest_chars = all_chunks[cursor..].iter()
+                .take(MAX_BATCH)
+                .last()
+                .map(|c| c.text.len())
+                .unwrap_or(100);
+            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
+            let adaptive_size = (VRAM_BUDGET / (est_tokens * est_tokens)) as usize;
+            let effective_batch_size = if batch_size > 0 {
+                batch_size.min(adaptive_size).max(MIN_BATCH)
+            } else {
+                adaptive_size.clamp(MIN_BATCH, MAX_BATCH)
+            };
+
+            let end = (cursor + effective_batch_size).min(all_chunks.len());
+            let batch_chunks = &all_chunks[cursor..end];
+
+            let batch_start = std::time::Instant::now();
+            let texts: Vec<&str> = batch_chunks.iter().map(|c| c.text.as_str()).collect();
+
+            let embeddings = embedder.encode_batch(&texts)?;
+
+            let batch_elapsed = batch_start.elapsed();
+            eprintln!("[{}] Batch {} ({}-{}/{}): {} chunks (adaptive b={}) in {:.1}s ({:.1} chunks/sec)",
+                chrono_timestamp(),
+                batch_idx + 1,
+                cursor + 1,
+                end,
+                total_chunks,
+                batch_chunks.len(),
+                effective_batch_size,
+                batch_elapsed.as_secs_f64(),
+                batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
+
+            // Upload this embedding batch immediately instead of accumulating
+            let batch_embedded: Vec<(engine::Chunk, Vec<f32>)> = batch_chunks
+                .iter()
+                .zip(embeddings.into_iter())
+                .map(|(chunk, embedding)| (chunk.clone(), embedding))
+                .collect();
+            for upload_batch in batch_embedded.chunks(100) {
+                uploader.upload_batch(upload_batch)?;
+                for (chunk, _) in upload_batch {
+                    let fid = engine::util::display_file_id(chunk.file_id);
+                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                    file_expected.entry(fid).or_insert(chunk.chunk_count);
+                }
+            }
+            total_embedded += batch_embedded.len();
+            drop(batch_embedded);
+
+            cursor = end;
+            batch_idx += 1;
+        }
+        // Free chunks now that all batches are embedded and uploaded
+        drop(all_chunks);
+
+        let embed_elapsed = embed_start.elapsed();
+        let embed_rate = total_chunks as f64 / embed_elapsed.as_secs_f64().max(0.001);
+        println!("  Embedding + upload complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
+
+        // Mark files complete
+        for (fid, count) in &file_chunks {
+            if Some(count) == file_expected.get(fid) {
+                let _ = uploader.mark_file_complete(fid, catalog_name);
+            }
+        }
+
+        let total_elapsed_phase2 = embed_elapsed.as_secs_f64();
+        println!();
+        println!("  ✅ Embedded & uploaded {} chunks in {}", total_embedded, format_duration(total_elapsed_phase2));
+        println!("  📊 Rate: {:.1} chunks/sec (embed + upload)", total_embedded as f64 / total_elapsed_phase2.max(0.001));
+        println!();
+
+        // Phase 3: Cleanup orphaned files
+        println!("🗑️  Cleaning up orphaned files...");
+        for (rel_path, _) in existing_files.iter() {
+            if !rel_files_set.contains(rel_path) {
+                uploader.delete_file(rel_path, catalog_name)?;
+                files_deleted += 1;
+            }
+        }
+
+        println!();
+        println!();
+        let total_elapsed = total_start.elapsed();
+
+        println!("✅ Crawl complete!");
+        println!();
+        println!("📊 Summary:");
+        println!("  Total time: {:?}", total_elapsed);
+        println!("  New files indexed: {}", new_count);
+        println!("  Changed files re-indexed: {}", changed_count);
+        println!("  Unchanged files skipped: {}", unchanged_count);
+        println!("  Orphaned files deleted: {}", orphaned_count);
+        println!();
+        println!("Total chunks indexed: {}", total_chunks);
+        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
+        println!("Files deleted from DB: {}", files_deleted);
+        println!();
+
+        // Update warning state
+        let mut next_warning_files: HashSet<String> = HashSet::new();
+        next_warning_files.extend(crawl_warning_files.iter().cloned());
+        if incremental_warnings {
+            next_warning_files.extend(warning_files.iter().cloned());
+        }
+        let json = serde_json::to_string_pretty(&next_warning_files)?;
+        std::fs::write(&warning_state_path, json)?;
+
+        if !crawl_warning_files.is_empty() {
+            let plural = if crawl_warning_files.len() == 1 { "file" } else { "files" };
+            println!("Chunking warnings in {} {}:", crawl_warning_files.len(), plural);
+            for file in crawl_warning_files.iter().take(20) {
+                println!("  - {}", file);
+            }
+            if crawl_warning_files.len() > 20 {
+                println!("  ... and {} more", crawl_warning_files.len() - 20);
+            }
+            println!();
+        }
+
+        return Ok(());
+    }
+
+    // ── Original streaming path (non-batch) ──
+    println!("⚡ Phase 2: Embedding {} chunks with {} parallel sessions...",
         total_chunks, embedder.num_workers());
     println!("  (Checkpoints every 60s - safe to CTRL+C)");
     let embed_start = std::time::Instant::now();
-    
+
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -474,7 +768,8 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     let stop_uploader = Arc::clone(&stop_flag);
     let last_upload_time_clone = Arc::clone(&last_upload_time);
     let uploader_clone = Arc::clone(&uploader);
-    
+    let catalog_name_for_uploader = catalog_name.to_string();
+
     let uploader_thread = std::thread::spawn(move || {
         let mut accumulated: Vec<(engine::Chunk, Vec<f32>)> = Vec::new();
         
@@ -553,7 +848,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                         
                         // Mark completed files and clean up tracking state
                         for file_id in &completed_files {
-                            if let Err(e) = uploader_guard.mark_file_complete(file_id) {
+                            if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
                                 eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
                             }
                             // Remove tracking state for completed files
@@ -613,7 +908,7 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                             }
                             
                             for file_id in &completed_files {
-                                if let Err(e) = uploader_guard.mark_file_complete(file_id) {
+                                if let Err(e) = uploader_guard.mark_file_complete(file_id, &catalog_name_for_uploader) {
                                     eprintln!("[{}] ⚠️ Failed to mark file complete: {}", chrono_timestamp(), e);
                                 }
                             }
@@ -670,9 +965,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
     println!("🗑️  Cleaning up orphaned files...");
     {
         let uploader_guard = uploader.lock().unwrap();
-        for (file_path, _) in existing_files.iter() {
-            if !files_set.contains(file_path) {
-                uploader_guard.delete_file(file_path, catalog_name)?;
+        for (rel_path, _) in existing_files.iter() {
+            if !rel_files_set.contains(rel_path) {
+                uploader_guard.delete_file(rel_path, catalog_name)?;
                 files_deleted += 1;
             }
         }
@@ -758,7 +1053,7 @@ fn run_search(config: &Config, text: &str, limit: usize, catalog: Option<&str>) 
 /// Run view command to display full chunks by IDs
 /// Parsed selector for file-based chunk queries
 #[derive(Debug, Clone)]
-enum ChunkSelector {
+pub(crate) enum ChunkSelector {
     /// All chunks in the file
     All,
     /// Single chunk at position N (1-indexed)
@@ -776,7 +1071,7 @@ enum ChunkSelector {
 /// - `700a4ba232fe9ddc:3` - chunk 3
 /// - `700a4ba232fe9ddc:2-3` - chunks 2 through 3
 /// - `700a4ba232fe9ddc:3-end` - chunk 3 through the last chunk
-fn parse_file_id_with_selector(s: &str) -> anyhow::Result<(String, ChunkSelector)> {
+pub(crate) fn parse_file_id_with_selector(s: &str) -> anyhow::Result<(String, ChunkSelector)> {
     let s = s.trim();
     
     // Check for selector suffix
@@ -991,7 +1286,7 @@ fn run_purge(config: &Config, catalog: Option<&str>, all: bool) -> anyhow::Resul
 }
 
 /// Check if a file is a text file we want to index
-fn is_text_file(path: &str) -> bool {
+pub(crate) fn is_text_file(path: &str) -> bool {
     let extensions = [
         "ts", "tsx", "js", "jsx",           // TypeScript/JavaScript
         "md", "mdx",                        // Markdown
