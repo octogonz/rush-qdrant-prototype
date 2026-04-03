@@ -16,6 +16,6 @@ pub mod package_lookup;
 
 // Re-export commonly used types for convenience
 pub use chunker::Chunk;
-pub use parallel_embedder::ParallelEmbedder;
+pub use parallel_embedder::{ParallelEmbedder, ParallelConfig};
 pub use partitioner::SMALL_CHUNK_CHARS;
 pub use uploader::QdrantUploader;

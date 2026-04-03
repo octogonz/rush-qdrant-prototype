@@ -432,13 +432,122 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
 
     // Phase 2: Embedding
     let use_batch = std::env::var("RUSH_QDRANT_BATCH").unwrap_or_default() == "1";
+    let use_cpu_batch = std::env::var("RUSH_QDRANT_CPU_BATCH").unwrap_or_default() == "1";
     let batch_size: usize = std::env::var("RUSH_QDRANT_BATCH_SIZE")
         .unwrap_or_else(|_| "0".to_string())
         .parse()
         .unwrap_or(0); // 0 = all at once
 
-    if use_batch {
-        // ── Batch-mode path: encode all chunks in large batches, then upload ──
+    if use_cpu_batch {
+        // ── CPU parallel-batch path: sort by length, mini-batch, distribute across workers ──
+        println!("⚡ Phase 2 (CPU-BATCH): Encoding {} chunks with {} workers (sorted + mini-batched)...",
+            total_chunks, embedder.num_workers());
+        let embed_start = std::time::Instant::now();
+
+        let uploader = QdrantUploader::new(&config.qdrant.collection, config.qdrant.url.as_deref())?;
+
+        // Sort chunks by text length for efficient batching
+        all_chunks.sort_by_key(|c| c.text.len());
+        println!("  Sorted chunks by length (shortest: {} chars, longest: {} chars)",
+            all_chunks.first().map(|c| c.text.len()).unwrap_or(0),
+            all_chunks.last().map(|c| c.text.len()).unwrap_or(0));
+
+        // Create adaptive mini-batches
+        const CHARS_PER_TOKEN: f64 = 4.0;
+        let mut mini_batches: Vec<Vec<engine::Chunk>> = Vec::new();
+        let mut cursor = 0;
+        while cursor < all_chunks.len() {
+            let longest_chars = all_chunks[cursor..]
+                .iter()
+                .take(32)
+                .last()
+                .map(|c| c.text.len())
+                .unwrap_or(100);
+            let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
+            let mb_size = ((4000.0 / est_tokens) as usize).clamp(4, 16);
+            let end = (cursor + mb_size).min(all_chunks.len());
+            mini_batches.push(all_chunks[cursor..end].to_vec());
+            cursor = end;
+        }
+        // Free original chunks — mini_batches owns copies now
+        drop(all_chunks);
+
+        println!("  Created {} mini-batches (sizes: {}-{})",
+            mini_batches.len(),
+            mini_batches.iter().map(|b| b.len()).min().unwrap_or(0),
+            mini_batches.iter().map(|b| b.len()).max().unwrap_or(0));
+
+        use rayon::prelude::*;
+        let all_embedded: Vec<(engine::Chunk, Vec<f32>)> = mini_batches
+            .into_par_iter()
+            .enumerate()
+            .flat_map(|(i, batch)| {
+                let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+                match embedder.encode_batch_on_worker(&texts, i) {
+                    Ok(embeddings) => batch.into_iter().zip(embeddings).collect::<Vec<_>>(),
+                    Err(e) => {
+                        eprintln!("[{}] ⚠️ Batch embedding failed: {}", chrono_timestamp(), e);
+                        Vec::new()
+                    }
+                }
+            })
+            .collect();
+
+        let embed_elapsed = embed_start.elapsed();
+        let embed_rate = all_embedded.len() as f64 / embed_elapsed.as_secs_f64().max(0.001);
+        println!("  Embedding complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
+
+        // Upload in batches of 100 and track file completion
+        println!("  Uploading {} chunks to Qdrant...", all_embedded.len());
+        let upload_start = std::time::Instant::now();
+        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for upload_batch in all_embedded.chunks(100) {
+            uploader.upload_batch(upload_batch)?;
+            for (chunk, _) in upload_batch {
+                let fid = engine::util::display_file_id(chunk.file_id);
+                *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                file_expected.entry(fid).or_insert(chunk.chunk_count);
+            }
+        }
+        for (fid, count) in &file_chunks {
+            if Some(count) == file_expected.get(fid) {
+                let _ = uploader.mark_file_complete(fid, catalog_name);
+            }
+        }
+        let embedded_count = all_embedded.len();
+        drop(all_embedded);
+
+        let upload_elapsed = upload_start.elapsed();
+        let total_phase2 = embed_elapsed.as_secs_f64() + upload_elapsed.as_secs_f64();
+        println!();
+        println!("  ✅ Embedded & uploaded {} chunks in {}", embedded_count, format_duration(total_phase2));
+        println!("  📊 Embedding rate: {:.1} chunks/sec (embed only)", embed_rate);
+        println!("  📊 Overall Phase 2 rate: {:.1} chunks/sec (embed + upload)", embedded_count as f64 / total_phase2.max(0.001));
+        println!();
+
+        // Phase 3: Cleanup
+        println!("🗑️  Cleaning up orphaned files...");
+        for (file_path, _) in existing_files.iter() {
+            if !files_set.contains(file_path) {
+                uploader.delete_file(file_path, catalog_name)?;
+                files_deleted += 1;
+            }
+        }
+
+        println!();
+        let total_elapsed = total_start.elapsed();
+        println!("✅ Crawl complete!");
+        println!("  Total time: {:?}", total_elapsed);
+        println!("  New files indexed: {}", new_count);
+        println!("  Changed files re-indexed: {}", changed_count);
+        println!("  Unchanged files skipped: {}", unchanged_count);
+        println!("Total chunks indexed: {}", total_chunks);
+        println!("Overall rate: {:.1} chunks/sec", total_chunks as f64 / total_elapsed.as_secs_f64().max(0.001));
+
+        return Ok(());
+    } else if use_batch {
+        // ── Batch-mode path: encode chunks in adaptive batches, upload immediately ──
         println!("⚡ Phase 2 (BATCH): Encoding {} chunks{}...",
             total_chunks,
             if batch_size > 0 { format!(" in batches of {}", batch_size) } else { " all at once".to_string() });
@@ -462,7 +571,9 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
         const MIN_BATCH: usize = 4;
         const MAX_BATCH: usize = 64;
 
-        let mut all_embedded: Vec<(engine::Chunk, Vec<f32>)> = Vec::with_capacity(total_chunks);
+        let mut total_embedded: usize = 0;
+        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut cursor = 0;
         let mut batch_idx = 0;
 
@@ -502,49 +613,44 @@ fn run_crawl(config: &Config, catalog_name: &str, incremental_warnings: bool) ->
                 batch_elapsed.as_secs_f64(),
                 batch_chunks.len() as f64 / batch_elapsed.as_secs_f64().max(0.001));
 
-            for (chunk, embedding) in batch_chunks.iter().zip(embeddings.into_iter()) {
-                all_embedded.push((chunk.clone(), embedding));
+            // Upload this embedding batch immediately instead of accumulating
+            let batch_embedded: Vec<(engine::Chunk, Vec<f32>)> = batch_chunks
+                .iter()
+                .zip(embeddings.into_iter())
+                .map(|(chunk, embedding)| (chunk.clone(), embedding))
+                .collect();
+            for upload_batch in batch_embedded.chunks(100) {
+                uploader.upload_batch(upload_batch)?;
+                for (chunk, _) in upload_batch {
+                    let fid = engine::util::display_file_id(chunk.file_id);
+                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                    file_expected.entry(fid).or_insert(chunk.chunk_count);
+                }
             }
+            total_embedded += batch_embedded.len();
+            drop(batch_embedded);
 
             cursor = end;
             batch_idx += 1;
         }
+        // Free chunks now that all batches are embedded and uploaded
+        drop(all_chunks);
 
         let embed_elapsed = embed_start.elapsed();
         let embed_rate = total_chunks as f64 / embed_elapsed.as_secs_f64().max(0.001);
-        println!("  Embedding complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
-
-        // Upload all at once
-        println!("  Uploading {} chunks to Qdrant...", all_embedded.len());
-        let upload_start = std::time::Instant::now();
-
-        // Upload in batches of 100 to avoid exceeding Qdrant limits
-        for upload_batch in all_embedded.chunks(100) {
-            uploader.upload_batch(upload_batch)?;
-        }
+        println!("  Embedding + upload complete: {:.1} chunks/sec ({:.1}s)", embed_rate, embed_elapsed.as_secs_f64());
 
         // Mark files complete
-        let mut file_chunks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut file_expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (chunk, _) in &all_embedded {
-            let fid = engine::util::display_file_id(chunk.file_id);
-            *file_chunks.entry(fid.clone()).or_insert(0) += 1;
-            file_expected.entry(fid).or_insert(chunk.chunk_count);
-        }
         for (fid, count) in &file_chunks {
             if Some(count) == file_expected.get(fid) {
                 let _ = uploader.mark_file_complete(fid, catalog_name);
             }
         }
 
-        let upload_elapsed = upload_start.elapsed();
-        println!("  Upload complete: {:.1}s", upload_elapsed.as_secs_f64());
-
-        let total_elapsed_phase2 = embed_elapsed.as_secs_f64() + upload_elapsed.as_secs_f64();
+        let total_elapsed_phase2 = embed_elapsed.as_secs_f64();
         println!();
-        println!("  ✅ Embedded & uploaded {} chunks in {}", total_chunks, format_duration(total_elapsed_phase2));
-        println!("  📊 Embedding rate: {:.1} chunks/sec (embed only)", embed_rate);
-        println!("  📊 Overall Phase 2 rate: {:.1} chunks/sec (embed + upload)", total_chunks as f64 / total_elapsed_phase2.max(0.001));
+        println!("  ✅ Embedded & uploaded {} chunks in {}", total_embedded, format_duration(total_elapsed_phase2));
+        println!("  📊 Rate: {:.1} chunks/sec (embed + upload)", total_embedded as f64 / total_elapsed_phase2.max(0.001));
         println!();
 
         // Phase 3: Cleanup orphaned files

@@ -127,40 +127,107 @@ pub fn run_incremental_crawl(
         }
     }
 
-    // Embed and upload chunks
+    // Embed and upload chunks in streaming batches to limit memory
     let total_chunks = all_chunks.len();
     if total_chunks > 0 {
         use rayon::prelude::*;
 
-        let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = all_chunks
-            .into_par_iter()
-            .enumerate()
-            .filter_map(|(i, chunk)| match embedder.encode(&chunk.text, i) {
-                Ok(embedding) => Some((chunk, embedding)),
-                Err(e) => {
-                    eprintln!(
-                        "[{}] Warning: embedding failed: {}",
-                        chrono_timestamp(),
-                        e
-                    );
-                    None
-                }
-            })
-            .collect();
+        let use_cpu_batch = std::env::var("RUSH_QDRANT_CPU_BATCH").unwrap_or_default() == "1";
 
-        // Upload in batches of 100
-        for upload_batch in embedded.chunks(100) {
-            uploader.upload_batch(upload_batch)?;
-        }
-
-        // Mark files complete
+        // Track file completion across upload batches
         let mut file_chunks: HashMap<String, usize> = HashMap::new();
         let mut file_expected: HashMap<String, usize> = HashMap::new();
-        for (chunk, _) in &embedded {
-            let fid = util::display_file_id(chunk.file_id);
-            *file_chunks.entry(fid.clone()).or_insert(0) += 1;
-            file_expected.entry(fid).or_insert(chunk.chunk_count);
-        }
+
+        if use_cpu_batch {
+            // Parallel batching: sort by length, group into mini-batches,
+            // distribute across workers for maximum throughput on CPU.
+            all_chunks.sort_by_key(|c| c.text.len());
+
+            // Adaptive mini-batch sizing: short chunks get larger batches
+            const CHARS_PER_TOKEN: f64 = 4.0;
+            let mut mini_batches: Vec<Vec<crate::engine::Chunk>> = Vec::new();
+            let mut cursor = 0;
+            while cursor < all_chunks.len() {
+                let longest_chars = all_chunks[cursor..]
+                    .iter()
+                    .take(32)
+                    .last()
+                    .map(|c| c.text.len())
+                    .unwrap_or(100);
+                let est_tokens = (longest_chars as f64 / CHARS_PER_TOKEN).max(1.0);
+                // CPU budget: scale batch size inversely with token count
+                // Short chunks (<250 tokens): batch=16, medium: batch=8, long: batch=4
+                let batch_size = ((4000.0 / est_tokens) as usize).clamp(4, 16);
+                let end = (cursor + batch_size).min(all_chunks.len());
+                mini_batches.push(all_chunks[cursor..end].to_vec());
+                cursor = end;
+            }
+            // Free the original chunks now that mini_batches owns copies
+            drop(all_chunks);
+
+            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = mini_batches
+                .into_par_iter()
+                .enumerate()
+                .flat_map(|(i, batch)| {
+                    let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+                    match embedder.encode_batch_on_worker(&texts, i) {
+                        Ok(embeddings) => batch
+                            .into_iter()
+                            .zip(embeddings)
+                            .collect::<Vec<_>>(),
+                        Err(e) => {
+                            eprintln!(
+                                "[{}] Warning: batch embedding failed: {}",
+                                chrono_timestamp(),
+                                e
+                            );
+                            Vec::new()
+                        }
+                    }
+                })
+                .collect();
+
+            // Upload in batches of 100 and free each batch
+            for upload_batch in embedded.chunks(100) {
+                uploader.upload_batch(upload_batch)?;
+                for (chunk, _) in upload_batch {
+                    let fid = util::display_file_id(chunk.file_id);
+                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                    file_expected.entry(fid).or_insert(chunk.chunk_count);
+                }
+            }
+            drop(embedded);
+        } else {
+            // Default: individual encode per chunk, parallel across workers
+            let embedded: Vec<(crate::engine::Chunk, Vec<f32>)> = all_chunks
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(i, chunk)| match embedder.encode(&chunk.text, i) {
+                    Ok(embedding) => Some((chunk, embedding)),
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] Warning: embedding failed: {}",
+                            chrono_timestamp(),
+                            e
+                        );
+                        None
+                    }
+                })
+                .collect();
+
+            // Upload in batches of 100 and free each batch
+            for upload_batch in embedded.chunks(100) {
+                uploader.upload_batch(upload_batch)?;
+                for (chunk, _) in upload_batch {
+                    let fid = util::display_file_id(chunk.file_id);
+                    *file_chunks.entry(fid.clone()).or_insert(0) += 1;
+                    file_expected.entry(fid).or_insert(chunk.chunk_count);
+                }
+            }
+            drop(embedded);
+        };
+
+        // Mark files complete
         for (fid, count) in &file_chunks {
             if Some(count) == file_expected.get(fid) {
                 let _ = uploader.mark_file_complete(fid, catalog_name);

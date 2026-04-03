@@ -34,6 +34,8 @@ pub struct ParallelConfig {
     pub use_cuda: bool,
     /// Model variant: "fp32", "fp16", or "int8"
     pub model_variant: String,
+    /// CUDA memory arena cap in bytes (default: 20GB for bulk, 512MB for query-only)
+    pub cuda_arena_bytes: usize,
 }
 
 impl Default for ParallelConfig {
@@ -49,6 +51,22 @@ impl Default for ParallelConfig {
             intra_threads,
             use_cuda,
             model_variant,
+            cuda_arena_bytes: 20 * 1024 * 1024 * 1024, // 20GB default for bulk crawl
+        }
+    }
+}
+
+impl ParallelConfig {
+    /// Config optimized for single-query embedding (CPU-only, no GPU contention)
+    pub fn for_query() -> Self {
+        let total_cores = num_cpus::get();
+        let model_variant = std::env::var("RUSH_QDRANT_MODEL").unwrap_or_else(|_| "fp32".to_string());
+        Self {
+            num_workers: 1,
+            intra_threads: total_cores.max(1),
+            use_cuda: false,
+            model_variant,
+            cuda_arena_bytes: 0,
         }
     }
 }
@@ -108,12 +126,12 @@ impl ParallelEmbedder {
                 if config.use_cuda {
                     use ort::ep::CUDA;
                     let cuda_ep = CUDA::default()
-                        .with_memory_limit(20 * 1024 * 1024 * 1024)
+                        .with_memory_limit(config.cuda_arena_bytes)
                         .build();
                     builder = builder
                         .with_execution_providers([cuda_ep])
                         .expect("Failed to register CUDA execution provider");
-                    println!("  Worker {}: CUDA execution provider registered (arena cap: 20GB)", i);
+                    println!("  Worker {}: CUDA execution provider registered (arena cap: {}MB)", i, config.cuda_arena_bytes / (1024 * 1024));
                 } else {
                     builder = builder
                         .with_intra_threads(config.intra_threads)
@@ -149,11 +167,17 @@ impl ParallelEmbedder {
     /// Pads all sequences to the max length within the batch.
     /// Returns one embedding per input text.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.encode_batch_on_worker(texts, 0)
+    }
+
+    /// Encode a batch of texts on a specific worker.
+    /// Use this for parallel batching: distribute mini-batches across workers.
+    pub fn encode_batch_on_worker(&self, texts: &[&str], worker_index: usize) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let worker = &self.workers[0];
+        let worker = &self.workers[worker_index % self.workers.len()];
         let mut guard = worker.lock().unwrap();
         let (session, tokenizer) = &mut *guard;
 

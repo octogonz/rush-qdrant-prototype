@@ -533,6 +533,15 @@ pub fn run_mcp(config: &Config, port: u16) -> anyhow::Result<()> {
         }
     }
 
+    // Step 3b: Release bulk-crawl embedder and recreate with small arena for queries.
+    // This frees the large CUDA arena (~20GB) and replaces it with a 512MB one.
+    drop(embedder);
+    eprintln!("Reloading embedding model with query-optimized settings...");
+    let embedder = Arc::new(ParallelEmbedder::with_config(
+        crate::engine::ParallelConfig::for_query(),
+    )?);
+    eprintln!();
+
     // Step 4: Start file watchers for each catalog
     for (name, catalog) in &config.catalogs {
         watcher::start_watcher(
